@@ -1,0 +1,19 @@
+# PV Layout Design System - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+numpy>=1.21.0
+opencv-python>=4.5.0
+matplotlib>=3.5.0
+
+# ML / Deep Learning
+torch>=1.12.0
+torchvision>=0.13.0
+
+# Web App
+streamlit>=1.20.0
+pandas>=1.4.0
+
+# Jupyter
+jupyter>=1.0.0
+ipykernel>=6.0.0
