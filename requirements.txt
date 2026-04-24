@@ -12,7 +12,9 @@ torchvision>=0.13.0
 
 # Web App
 streamlit>=1.20.0
+streamlit-image-coordinates>=0.1.6
 pandas>=1.4.0
+Pillow>=8.0.0
 
 # Jupyter
 jupyter>=1.0.0

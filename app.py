@@ -16,6 +16,8 @@ import tempfile
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from PIL import Image
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +48,37 @@ st.markdown("*Optimised for Malaysian Rooftop Solar under ATAP*")
 
 
 # ============================================================
+# HELPER FUNCTION - Convert canvas drawing to roof polygon
+# ============================================================
+def extract_polygon_from_canvas(canvas_result):
+    """Extract clicked corner points from canvas drawing and order them."""
+    if canvas_result is None or canvas_result.json_data is None:
+        return None
+
+    data = canvas_result.json_data
+    points = []
+
+    if 'objects' in data:
+        for obj in data['objects']:
+            # Each clicked point becomes a small circle on the canvas
+            x = obj['left'] + obj.get('width', 0) / 2
+            y = obj['top'] + obj.get('height', 0) / 2
+            points.append((int(x), int(y)))
+
+    if len(points) < 3:
+        return None
+
+    # Order points clockwise around centroid (so polygon doesn't self-intersect)
+    center = np.mean(points, axis=0)
+    angles = np.arctan2(np.array(points)[:, 1] - center[1],
+                        np.array(points)[:, 0] - center[0])
+    ordered_indices = np.argsort(angles)
+    ordered_points = [points[i] for i in ordered_indices]
+
+    return np.array(ordered_points, dtype=np.int32).reshape((-1, 1, 2))
+
+
+# ============================================================
 # SESSION STATE INIT
 # ============================================================
 if 'detector' not in st.session_state:
@@ -58,6 +91,12 @@ if 'panels' not in st.session_state:
     st.session_state.panels = []
 if 'image_loaded' not in st.session_state:
     st.session_state.image_loaded = False
+if 'manual_polygon' not in st.session_state:
+    st.session_state.manual_polygon = None
+if 'clicked_points' not in st.session_state:
+    st.session_state.clicked_points = []
+if 'last_click' not in st.session_state:
+    st.session_state.last_click = None
 
 
 # ============================================================
@@ -202,73 +241,233 @@ with tab1:
 
             detect_method = st.selectbox(
                 "Detection Method",
-                ["auto", "canny", "adaptive", "color", "manual"]
+                ["auto", "canny", "adaptive", "color", "manual_draw"]
             )
 
-            if st.button("🔍 Detect Roof Boundary", type="primary"):
+            # ============================================================
+            # MANUAL DRAWING MODE - Click to trace roof corners
+            # ============================================================
+            if detect_method == "manual_draw":
+                st.subheader("🖱️ Click to Mark Roof Corners")
+                st.info("Click on each corner of your roof on the image. "
+                        "Mark at least 3 points going around the roof outline.")
+
                 detector = st.session_state.detector
-                detector.set_north_angle(north_angle)
+                img_rgb = cv2.cvtColor(detector.original_image, cv2.COLOR_BGR2RGB)
+                orig_h, orig_w = img_rgb.shape[:2]
 
-                with st.spinner("Detecting roof boundary..."):
-                    try:
-                        if detect_method == "manual":
-                            # Use full image as roof area
-                            h, w = detector.image_shape
-                            margin = 20
-                            detector.manually_define_roof([
-                                (margin, margin),
-                                (w - margin, margin),
-                                (w - margin, h - margin),
-                                (margin, h - margin)
-                            ])
-                        else:
-                            detector.detect_roof_boundary(method=detect_method)
+                # Work out a scale that makes the entire image fit the browser.
+                MAX_DISPLAY_WIDTH = 900
+                scale = min(1.0, MAX_DISPLAY_WIDTH / float(orig_w))
 
-                        detector.set_scale_from_roof_dims(roof_length, roof_width)
+                # Inverse-scaled marker sizes so they stay visible (but not
+                # huge) after the image is downscaled for display.
+                mark_r_inner = max(4, int(round(8 / scale)))
+                mark_r_outer = max(6, int(round(10 / scale)))
+                line_thk = max(1, int(round(2 / scale)))
+                font_sc = max(0.4, 0.6 / scale)
 
-                        # Detect obstacles
-                        candidates = detector.detect_potential_obstacles()
+                # Draw existing click markers on the ORIGINAL-resolution copy
+                # so the markers render crisply after downscaling.
+                display_img = img_rgb.copy()
+                pts_so_far = st.session_state.clicked_points
+                for idx, (px, py) in enumerate(pts_so_far):
+                    cv2.circle(display_img, (px, py), mark_r_inner,
+                               (255, 0, 0), -1)
+                    cv2.circle(display_img, (px, py), mark_r_outer,
+                               (255, 255, 255), line_thk)
+                    cv2.putText(display_img, str(idx + 1),
+                                (px + mark_r_outer + 2,
+                                 py - mark_r_outer - 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_sc,
+                                (255, 255, 255), line_thk)
+                if len(pts_so_far) >= 2:
+                    arr = np.array(pts_so_far, dtype=np.int32)
+                    cv2.polylines(display_img, [arr], False,
+                                  (0, 255, 255), line_thk + 1)
 
-                        # Classify if model is trained
-                        clf = st.session_state.classifier
-                        if clf.is_trained:
-                            candidates = clf.classify_batch(candidates)
+                # Physically resize the pixel buffer so the widget displays
+                # the FULL image (not a cropped region). Passing width/height
+                # into streamlit_image_coordinates directly was cropping.
+                if scale < 1.0:
+                    disp_w = int(round(orig_w * scale))
+                    disp_h = int(round(orig_h * scale))
+                    display_img_small = cv2.resize(
+                        display_img, (disp_w, disp_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    display_img_small = display_img
 
-                        # Remove non-"none" obstacles
-                        obs_contours = [
-                            o['contour'] for o in candidates
-                            if o.get('label', 'unknown') != 'none'
-                        ]
-                        if obs_contours:
-                            detector.remove_obstacles_from_mask(obs_contours)
+                # Widget returns the LAST click only; we accumulate ourselves.
+                coord = streamlit_image_coordinates(
+                    Image.fromarray(display_img_small),
+                    key="roof_corners",
+                )
 
-                        # Store candidates
-                        st.session_state.candidates = candidates
+                if coord is not None:
+                    # Click arrives in displayed-image coords -> convert back
+                    # to ORIGINAL image coords so the detector polygon lines
+                    # up with the real photo.
+                    new_point = (
+                        int(round(coord["x"] / scale)),
+                        int(round(coord["y"] / scale)),
+                    )
+                    # Clamp to valid image bounds.
+                    new_point = (
+                        max(0, min(orig_w - 1, new_point[0])),
+                        max(0, min(orig_h - 1, new_point[1])),
+                    )
+                    if st.session_state.last_click != new_point:
+                        st.session_state.last_click = new_point
+                        st.session_state.clicked_points.append(new_point)
+                        st.rerun()
 
-                        # Display results
-                        summary = detector.get_detection_summary()
-                        st.success("Roof boundary detected!")
-                        st.json(summary)
-
-                        # Show detected boundary overlay
-                        vis_img = detector.original_image.copy()
-                        cv2.drawContours(
-                            vis_img, [detector.roof_contour], -1, (0, 255, 0), 3
-                        )
-                        for obs in candidates:
-                            if obs.get('label') != 'none':
-                                cv2.drawContours(
-                                    vis_img, [obs['contour']], -1, (0, 0, 255), 2
+                ctrl_cols = st.columns([1, 1, 3])
+                with ctrl_cols[0]:
+                    if st.button("↩️ Undo Last") and st.session_state.clicked_points:
+                        st.session_state.clicked_points.pop()
+                        st.session_state.last_click = None
+                        st.rerun()
+                with ctrl_cols[1]:
+                    if st.button("🗑️ Clear All"):
+                        st.session_state.clicked_points = []
+                        st.session_state.last_click = None
+                        st.rerun()
+                with ctrl_cols[2]:
+                    st.write(f"**Points clicked: {len(st.session_state.clicked_points)}**")
+                    if st.session_state.clicked_points:
+                        st.caption(
+                            " · ".join(
+                                f"{i+1}:({x},{y})"
+                                for i, (x, y) in enumerate(
+                                    st.session_state.clicked_points
                                 )
-                        st.image(
-                            cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB),
-                            caption="Detected Boundaries",
-                            use_container_width=True
+                            )
                         )
 
-                    except Exception as e:
-                        st.error(f"Detection failed: {str(e)}")
-                        st.info("Try 'manual' method or adjust image quality.")
+                clicked_points = st.session_state.clicked_points
+
+                if st.button("✅ Confirm Roof Polygon", type="primary"):
+                    if clicked_points and len(clicked_points) >= 3:
+                        try:
+                            # Use the clicked points
+                            points = clicked_points
+
+                            # Order points clockwise around centroid
+                            center = np.mean(points, axis=0)
+                            angles = np.arctan2(np.array(points)[:, 1] - center[1],
+                                              np.array(points)[:, 0] - center[0])
+                            ordered_indices = np.argsort(angles)
+                            ordered_points = [points[i] for i in ordered_indices]
+
+                            polygon = np.array(ordered_points, dtype=np.int32).reshape((-1, 1, 2))
+
+                            detector.set_north_angle(north_angle)
+                            detector.roof_contour = polygon
+                            detector.set_scale_from_roof_dims(roof_length, roof_width)
+                            detector._create_usable_area_mask()
+
+                            # Detect obstacles within the manual boundary
+                            candidates = detector.detect_potential_obstacles()
+
+                            # Classify if model is trained
+                            clf = st.session_state.classifier
+                            if clf.is_trained:
+                                candidates = clf.classify_batch(candidates)
+
+                            # Remove non-"none" obstacles from usable area
+                            obs_contours = [
+                                o['contour'] for o in candidates
+                                if o.get('label', 'unknown') != 'none'
+                            ]
+                            if obs_contours:
+                                detector.remove_obstacles_from_mask(obs_contours)
+
+                            st.session_state.candidates = candidates
+                            st.session_state.manual_polygon = polygon
+
+                            # Display results
+                            summary = detector.get_detection_summary()
+                            st.success(f"✅ Roof boundary confirmed with {len(polygon)} corners!")
+                            st.json(summary)
+
+                            # Show boundary overlay
+                            vis_img = detector.original_image.copy()
+                            cv2.drawContours(
+                                vis_img, [detector.roof_contour], -1, (0, 255, 0), 3
+                            )
+                            for obs in candidates:
+                                if obs.get('label') != 'none':
+                                    cv2.drawContours(
+                                        vis_img, [obs['contour']], -1, (0, 0, 255), 2
+                                    )
+                            st.image(
+                                cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB),
+                                caption="Manual Roof Boundary",
+                                use_container_width=True
+                            )
+                        except Exception as e:
+                            st.error(f"Processing failed: {str(e)}")
+                    else:
+                        st.error("Please click at least 3 points on the roof corners first.")
+
+            # ============================================================
+            # AUTOMATIC DETECTION MODES
+            # ============================================================
+            else:
+                if st.button("🔍 Detect Roof Boundary", type="primary"):
+                    detector = st.session_state.detector
+                    detector.set_north_angle(north_angle)
+
+                    with st.spinner("Detecting roof boundary..."):
+                        try:
+                            detector.detect_roof_boundary(method=detect_method)
+                            detector.set_scale_from_roof_dims(roof_length, roof_width)
+
+                            # Detect obstacles
+                            candidates = detector.detect_potential_obstacles()
+
+                            # Classify if model is trained
+                            clf = st.session_state.classifier
+                            if clf.is_trained:
+                                candidates = clf.classify_batch(candidates)
+
+                            # Remove non-"none" obstacles
+                            obs_contours = [
+                                o['contour'] for o in candidates
+                                if o.get('label', 'unknown') != 'none'
+                            ]
+                            if obs_contours:
+                                detector.remove_obstacles_from_mask(obs_contours)
+
+                            # Store candidates
+                            st.session_state.candidates = candidates
+
+                            # Display results
+                            summary = detector.get_detection_summary()
+                            st.success("Roof boundary detected!")
+                            st.json(summary)
+
+                            # Show detected boundary overlay
+                            vis_img = detector.original_image.copy()
+                            cv2.drawContours(
+                                vis_img, [detector.roof_contour], -1, (0, 255, 0), 3
+                            )
+                            for obs in candidates:
+                                if obs.get('label') != 'none':
+                                    cv2.drawContours(
+                                        vis_img, [obs['contour']], -1, (0, 0, 255), 2
+                                    )
+                            st.image(
+                                cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB),
+                                caption="Detected Boundaries",
+                                use_container_width=True
+                            )
+
+                        except Exception as e:
+                            st.error(f"Detection failed: {str(e)}")
+                            st.info("Try 'manual_draw' method to click roof corners yourself.")
 
 
 # ============================================================

@@ -7,9 +7,8 @@ All constants, panel specs, irradiance data, and system parameters.
 
 import os
 
-# ============================================================
 # PROJECT PATHS
-# ============================================================
+# initialize every files directory 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_DIR = os.path.join(BASE_DIR, "dataset")
 OBSTACLE_DATASET_DIR = os.path.join(DATASET_DIR, "obstacles")
