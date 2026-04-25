@@ -13,8 +13,8 @@ models/
 *.pth
 *.pt
 
-# Training data (large, regenerated from scratch)
-dataset/obstacles/
+# Training data
+# (dataset/obstacles/ is now tracked since total size is small enough)
 
 # Runtime outputs
 outputs/
